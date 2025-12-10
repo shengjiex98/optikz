@@ -59,20 +59,19 @@ sudo apt-get install ghostscript
 # Clone or navigate to the project directory
 cd optikz-backend
 
-# Create a virtual environment
-uv venv
+# Install the package and create/sync virtual environment automatically
+uv sync
 
-# Activate the virtual environment
+# Or install with development tools
+uv sync --extra dev
+
+# Activate the virtual environment (optional, uv can run commands directly)
 source .venv/bin/activate  # On macOS/Linux
 # or
 .venv\Scripts\activate     # On Windows
-
-# Install the package with dependencies
-uv pip install -e .
-
-# Install with development tools (optional)
-uv pip install -e ".[dev]"
 ```
+
+**Note:** `uv sync` automatically creates a virtual environment, installs dependencies, and generates a `uv.lock` file for reproducible builds.
 
 ### Using pip
 
@@ -110,20 +109,23 @@ Add this to your `~/.bashrc`, `~/.zshrc`, or equivalent to make it permanent.
 ### Command Line
 
 ```bash
-# Basic usage (3 iterations, 0.9 threshold)
+# Using uv (no activation needed)
+uv run optikz-backend examples/your_diagram.png
+
+# Or if you've activated the virtual environment
 optikz-backend examples/your_diagram.png
 
 # Or using python -m
-python -m optikz_backend.cli.main examples/your_diagram.png
+uv run python -m optikz_backend.cli.main examples/your_diagram.png
 
 # Custom parameters
-optikz-backend examples/your_diagram.png --iters 5 --threshold 0.95
+uv run optikz-backend examples/your_diagram.png --iters 5 --threshold 0.95
 
 # Specify output directory and open report
-optikz-backend examples/your_diagram.png --work-root my_runs/ --open-report
+uv run optikz-backend examples/your_diagram.png --work-root my_runs/ --open-report
 
 # Skip HTML report generation
-optikz-backend examples/your_diagram.png --no-report
+uv run optikz-backend examples/your_diagram.png --no-report
 ```
 
 **CLI Options:**
@@ -210,14 +212,18 @@ runs/
 ## Running Tests
 
 ```bash
-# Install dev dependencies
-uv pip install -e ".[dev]"
+# Install with dev dependencies (if not already done)
+uv sync --extra dev
 
-# Run tests
-pytest tests/
+# Run tests using uv
+uv run pytest tests/
 
 # Run with coverage
-pytest tests/ --cov=optikz_backend
+uv run pytest tests/ --cov=optikz_backend
+
+# Or activate the venv and run directly
+source .venv/bin/activate
+pytest tests/
 ```
 
 **Note:** Most integration tests are skipped by default as they require API keys and make real API calls.
@@ -302,22 +308,24 @@ This is an initial architecture designed for clarity and extensibility. Contribu
 ### Development Setup
 
 ```bash
-# Install dev dependencies
-uv pip install -e ".[dev]"
+# Install with dev dependencies
+uv sync --extra dev
 
 # Set up pre-commit hooks (recommended)
-pre-commit install
+uv run pre-commit install
 
 # Run code formatters manually
-black .
-ruff check --fix .
+uv run black .
+uv run ruff check --fix .
 
 # Run type checker
-mypy src/
+uv run mypy src/
 
 # Run tests
-pytest
+uv run pytest
 ```
+
+**Using uv commands:** `uv run` automatically uses the project's virtual environment without needing activation.
 
 ## License
 
