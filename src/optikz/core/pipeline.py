@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .llm import initial_tikz_from_llm, refine_tikz_via_llm
-from .render import calc_similarity, render_tikz
+from .render import TikzCompilationError, calc_similarity, render_tikz
 
 
 @dataclass
@@ -18,14 +18,16 @@ class IterationResult:
     Attributes:
         step: Iteration number (0-based)
         tikz: TikZ code for this iteration
-        rendered_path: Path to the rendered PNG
+        rendered_path: Path to the rendered PNG (None if rendering failed)
         similarity: Similarity score vs target (None if not computed)
+        compile_error: LaTeX compilation error snippet when rendering fails
     """
 
     step: int
     tikz: str
-    rendered_path: Path
+    rendered_path: Path | None
     similarity: float | None
+    compile_error: str | None = None
 
 
 @dataclass
@@ -90,6 +92,7 @@ def convert_with_iterations(
 
     # Copy original image to run directory for reference
     import shutil
+
     original_copy = run_dir / f"original{image_path.suffix}"
     shutil.copy(image_path, original_copy)
 
@@ -106,50 +109,96 @@ def convert_with_iterations(
     iterations: list[IterationResult] = []
 
     # Iterative refinement loop
-    for step in range(max_iters):
-        print(f"\n[Step {step}] Rendering TikZ...")
+    tikz_version = 0
+    successful_iters = 0
+    attempt = 0
+
+    while successful_iters < max_iters:
+        print(f"\n[Attempt {attempt}] Rendering TikZ...")
 
         # Create iteration subdirectory
-        iter_dir = run_dir / f"iter_{step}"
+        iter_dir = run_dir / f"iter_{attempt}"
         iter_dir.mkdir(exist_ok=True)
 
         # Render current TikZ
         try:
             rendered_path = render_tikz(current_tikz, iter_dir)
+        except TikzCompilationError as compile_err:
+            error_excerpt = compile_err.log_excerpt or str(compile_err)
+            print(f"Warning: Compilation failed at attempt {attempt}:\n{error_excerpt}")
+            # Save the failed TikZ for inspection
+            (iter_dir / "failed.tex").write_text(current_tikz)
+            if error_excerpt:
+                (iter_dir / "latex_error.txt").write_text(error_excerpt)
+
+            iterations.append(
+                IterationResult(
+                    step=attempt,
+                    tikz=current_tikz,
+                    rendered_path=None,
+                    similarity=None,
+                    compile_error=error_excerpt,
+                )
+            )
+
+            print(
+                f"[Attempt {attempt}] Refining TikZ via LLM to fix compilation issues..."
+            )
+            try:
+                current_tikz = refine_tikz_via_llm(
+                    original_image_path=image_path,
+                    rendered_image_path=None,
+                    current_tikz=current_tikz,
+                    latex_error=error_excerpt,
+                )
+            except Exception as e:
+                print(f"Warning: Refinement after compilation failure failed: {e}")
+                raise
+
+            tikz_version += 1
+            (run_dir / f"iteration_{tikz_version}.tex").write_text(current_tikz)
+            attempt += 1
+            continue
         except Exception as e:
-            print(f"Warning: Rendering failed at step {step}: {e}")
+            print(f"Warning: Rendering failed at attempt {attempt}: {e}")
             # Save the failed TikZ for inspection
             (iter_dir / "failed.tex").write_text(current_tikz)
             raise
 
         # Calculate similarity
-        print(f"[Step {step}] Calculating similarity...")
+        print(f"[Attempt {attempt}] Calculating similarity...")
         similarity = calc_similarity(image_path, rendered_path)
-        print(f"[Step {step}] Similarity: {similarity:.4f}")
+        print(f"[Attempt {attempt}] Similarity: {similarity:.4f}")
 
         # Record iteration result
         iterations.append(
             IterationResult(
-                step=step,
+                step=attempt,
                 tikz=current_tikz,
                 rendered_path=rendered_path,
                 similarity=similarity,
             )
         )
 
+        successful_iters += 1
+
         # Check stopping conditions
-        if similarity >= similarity_threshold:
+        threshold_met = similarity >= similarity_threshold
+        max_reached = successful_iters >= max_iters
+        attempt += 1
+
+        if threshold_met:
             print(
                 f"\n✓ Threshold reached! Similarity {similarity:.4f} >= {similarity_threshold}"
             )
             break
 
-        if step == max_iters - 1:
+        if max_reached:
             print(f"\n✓ Max iterations ({max_iters}) reached.")
             break
 
         # Refine TikZ for next iteration
-        print(f"[Step {step}] Refining TikZ via LLM...")
+        print(f"[Iteration {successful_iters - 1}] Refining TikZ via LLM...")
         try:
             current_tikz = refine_tikz_via_llm(
                 original_image_path=image_path,
@@ -157,11 +206,14 @@ def convert_with_iterations(
                 current_tikz=current_tikz,
             )
         except Exception as e:
-            print(f"Warning: Refinement failed at step {step}: {e}")
+            print(
+                f"Warning: Refinement failed at iteration {successful_iters - 1}: {e}"
+            )
             raise
 
         # Save refined TikZ for next iteration
-        (run_dir / f"iteration_{step + 1}.tex").write_text(current_tikz)
+        tikz_version += 1
+        (run_dir / f"iteration_{tikz_version}.tex").write_text(current_tikz)
 
     # Save final TikZ
     final_tikz_path = run_dir / "final_tikz.tex"
@@ -169,16 +221,20 @@ def convert_with_iterations(
     print(f"\n✓ Final TikZ saved to: {final_tikz_path}")
 
     # Create complete LaTeX document for easy compilation
-    standalone_doc = r"""\documentclass[tikz,border=2mm]{standalone}
+    standalone_doc = (
+        r"""\documentclass[tikz,border=2mm]{standalone}
 \usepackage{tikz}
 \usetikzlibrary{shapes,arrows,positioning,calc,patterns,decorations.pathreplacing}
 
 \begin{document}
 \begin{tikzpicture}
-""" + current_tikz + r"""
+"""
+        + current_tikz
+        + r"""
 \end{tikzpicture}
 \end{document}
 """
+    )
     (run_dir / "final_standalone.tex").write_text(standalone_doc)
 
     return RunResult(

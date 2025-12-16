@@ -14,7 +14,12 @@ from unittest.mock import MagicMock
 import pytest
 from PIL import Image
 
-from optikz.core.render import calc_similarity, render_tikz
+from optikz.core.render import (
+    TikzCompilationError,
+    calc_similarity,
+    compile_tikz,
+    render_tikz,
+)
 
 
 def test_render_tikz_subprocess_invocation(tmp_path: Path, monkeypatch):
@@ -33,6 +38,9 @@ def test_render_tikz_subprocess_invocation(tmp_path: Path, monkeypatch):
 
     # Track subprocess calls
     subprocess_calls = []
+
+    # Pretend required tools exist
+    monkeypatch.setattr("shutil.which", lambda tool: f"/usr/bin/{tool}")
 
     # Mock subprocess.run
     def mock_subprocess_run(cmd, **kwargs):
@@ -196,8 +204,51 @@ def test_render_tikz_raises_on_pdflatex_failure(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr("subprocess.run", mock_subprocess_run)
 
-    with pytest.raises(RuntimeError, match="pdflatex compilation failed"):
+    with pytest.raises(TikzCompilationError, match="pdflatex compilation failed"):
         render_tikz(tikz_code, out_dir)
+
+
+def test_compile_tikz_success(tmp_path: Path, monkeypatch):
+    """
+    compile_tikz should return (True, None) when pdflatex succeeds.
+    """
+    tikz_code = r"\draw (0,0) -- (1,1);"
+
+    # Pretend pdflatex exists
+    monkeypatch.setattr("shutil.which", lambda tool: f"/usr/bin/{tool}")
+
+    def mock_subprocess_run(cmd, **kwargs):
+        cwd = kwargs["cwd"]
+        (cwd / "diagram.pdf").write_bytes(b"%PDF")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", mock_subprocess_run)
+
+    success, log_excerpt = compile_tikz(tikz_code, tmp_path)
+    assert success is True
+    assert log_excerpt is None
+    assert (tmp_path / "diagram.tex").exists()
+
+
+def test_compile_tikz_returns_log_excerpt_on_failure(tmp_path: Path, monkeypatch):
+    """
+    compile_tikz should surface LaTeX log excerpts when compilation fails.
+    """
+    tikz_code = r"\invalid"
+
+    monkeypatch.setattr("shutil.which", lambda tool: f"/usr/bin/{tool}")
+
+    def mock_subprocess_run(cmd, **kwargs):
+        cwd = kwargs["cwd"]
+        log = cwd / "diagram.log"
+        log.write_text("! Undefined control sequence.\nl.12 \\invalid")
+        return MagicMock(returncode=1, stdout="STDOUT", stderr="STDERR")
+
+    monkeypatch.setattr("subprocess.run", mock_subprocess_run)
+
+    success, log_excerpt = compile_tikz(tikz_code, tmp_path)
+    assert success is False
+    assert "Undefined control sequence" in (log_excerpt or "")
 
 
 def test_calc_similarity_basic(tmp_path: Path):

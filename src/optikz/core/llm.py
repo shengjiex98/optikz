@@ -11,7 +11,6 @@ from pathlib import Path
 
 from openai import OpenAI
 
-
 # TODO: Make model configurable via environment or config
 DEFAULT_MODEL = "gpt-4o"
 
@@ -87,9 +86,7 @@ Output the TikZ code directly without additional explanation.
                     {"type": "text", "text": prompt},
                     {
                         "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{base64_image}"
-                        },
+                        "image_url": {"url": f"data:{mime_type};base64,{base64_image}"},
                     },
                 ],
             }
@@ -116,23 +113,25 @@ Output the TikZ code directly without additional explanation.
 
 def refine_tikz_via_llm(
     original_image_path: Path,
-    rendered_image_path: Path,
+    rendered_image_path: Path | None,
     current_tikz: str,
+    latex_error: str | None = None,
 ) -> str:
     """
     Refine existing TikZ code by comparing original and rendered images.
 
     Args:
         original_image_path: Path to the original target diagram
-        rendered_image_path: Path to the currently rendered TikZ output
+        rendered_image_path: Path to the currently rendered TikZ output (if available)
         current_tikz: The current TikZ code to refine
+        latex_error: Optional LaTeX log excerpt if compilation failed
 
     Returns:
         Refined TikZ code as a string
 
     Raises:
         ValueError: If OPENAI_API_KEY is not set
-        FileNotFoundError: If either image path does not exist
+        FileNotFoundError: If required image paths do not exist
     """
     if not os.getenv("OPENAI_API_KEY"):
         raise ValueError("OPENAI_API_KEY environment variable not set")
@@ -140,80 +139,108 @@ def refine_tikz_via_llm(
     if not original_image_path.exists():
         raise FileNotFoundError(f"Original image not found: {original_image_path}")
 
-    if not rendered_image_path.exists():
+    if rendered_image_path is not None and not rendered_image_path.exists():
         raise FileNotFoundError(f"Rendered image not found: {rendered_image_path}")
 
     client = OpenAI()
 
     # Encode both images
     original_b64 = _encode_image(original_image_path)
-    rendered_b64 = _encode_image(rendered_image_path)
+    rendered_b64 = (
+        _encode_image(rendered_image_path) if rendered_image_path is not None else None
+    )
 
     # Determine MIME types
     orig_ext = original_image_path.suffix.lower()
-    rend_ext = rendered_image_path.suffix.lower()
     orig_mime = "image/png" if orig_ext == ".png" else "image/jpeg"
-    rend_mime = "image/png" if rend_ext == ".png" else "image/jpeg"
+    rend_mime = None
+    if rendered_image_path is not None:
+        rend_ext = rendered_image_path.suffix.lower()
+        rend_mime = "image/png" if rend_ext == ".png" else "image/jpeg"
 
     # Prompt for refinement
     # Ask the LLM to compare and correct
-    prompt = f"""
+    prompt_sections = [
+        """
 You are an expert at refining TikZ code to match target diagrams.
 
 I will provide:
 1. The ORIGINAL target diagram (what we want to match)
-2. The RENDERED output from current TikZ code
-3. The CURRENT TikZ code
+2. The RENDERED output from current TikZ code (if available)
+3. The CURRENT TikZ code (with any LaTeX error logs, if compilation failed)
 
 Your task:
-- Compare the original and rendered images
+- Compare the provided information
 - Identify differences (position, size, color, style, text, etc.)
 - Output CORRECTED TikZ code that better matches the original
 
 Requirements:
 - Output ONLY the corrected TikZ code (contents of \\begin{{tikzpicture}}...\\end{{tikzpicture}})
 - Do NOT include LaTeX boilerplate
-- Focus on fixing the most significant visual differences
+- Ensure the TikZ compiles successfully
 - Keep the code clean and maintainable
-
+""".strip(),
+        f"""
 Current TikZ code:
 ```
 {current_tikz}
 ```
+""".strip(),
+    ]
 
-Now compare the original (target) vs rendered (current output) and provide corrected TikZ code.
+    if latex_error:
+        prompt_sections.append(
+            f"""
+LaTeX compilation error excerpt:
+```
+{latex_error}
+```
 """.strip()
+        )
+
+    if rendered_image_path is None:
+        prompt_sections.append(
+            "No rendered comparison image is available because compilation failed. "
+            "Use the error log and the original diagram to correct the TikZ."
+        )
+
+    prompt = "\n\n".join(section for section in prompt_sections if section)
+
+    content = [
+        {"type": "text", "text": prompt},
+        {"type": "text", "text": "ORIGINAL (target):"},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:{orig_mime};base64,{original_b64}"},
+        },
+    ]
+
+    if rendered_b64 and rend_mime:
+        content.extend(
+            [
+                {"type": "text", "text": "RENDERED (current output):"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{rend_mime};base64,{rendered_b64}",
+                    },
+                },
+            ]
+        )
+    elif rendered_image_path is None:
+        content.append(
+            {
+                "type": "text",
+                "text": (
+                    "Rendered image unavailable (compile error). "
+                    "Focus on fixing the TikZ using the error log."
+                ),
+            }
+        )
 
     response = client.chat.completions.create(
         model=DEFAULT_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "text",
-                        "text": "ORIGINAL (target):"
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{orig_mime};base64,{original_b64}"
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": "RENDERED (current output):"
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{rend_mime};base64,{rendered_b64}"
-                        },
-                    },
-                ],
-            }
-        ],
+        messages=[{"role": "user", "content": content}],
         max_tokens=2000,
         temperature=0.2,
     )

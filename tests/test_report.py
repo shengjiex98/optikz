@@ -219,3 +219,38 @@ def test_write_html_report_run_directory_name(fake_iteration_results):
     # The run directory name should appear in the summary
     run_dir_name = result.run_dir.name
     assert run_dir_name in html_content
+
+
+def test_write_html_report_marks_compile_failures(tmp_path):
+    """
+    Iterations with compilation errors should be clearly marked in the report.
+    """
+    from PIL import Image
+
+    from optikz.core.pipeline import IterationResult, RunResult
+
+    run_dir = tmp_path / "run_compile_error"
+    run_dir.mkdir()
+
+    original = run_dir / "original.png"
+    img = Image.new("RGB", (20, 20), color="white")
+    img.save(original)
+
+    iteration = IterationResult(
+        step=0,
+        tikz="\\draw (0,0) -- (1,1);",
+        rendered_path=None,
+        similarity=None,
+        compile_error="! Undefined control sequence.",
+    )
+
+    result = RunResult(
+        final_tikz=iteration.tikz, iterations=[iteration], run_dir=run_dir
+    )
+
+    report_path = write_html_report(result)
+    html_content = report_path.read_text()
+
+    assert "Compilation failed" in html_content
+    assert "! Undefined control sequence." in html_content
+    assert "Rendered image unavailable" in html_content

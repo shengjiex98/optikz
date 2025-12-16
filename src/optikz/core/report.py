@@ -28,8 +28,8 @@ def write_html_report(result: RunResult) -> Path:
     report_path = result.run_dir / "report.html"
 
     # Helper to encode image as base64 data URI
-    def image_to_data_uri(img_path: Path) -> str:
-        if not img_path.exists():
+    def image_to_data_uri(img_path: Path | None) -> str:
+        if not img_path or not img_path.exists():
             return ""
         with open(img_path, "rb") as f:
             img_data = base64.b64encode(f.read()).decode("utf-8")
@@ -138,6 +138,18 @@ def write_html_report(result: RunResult) -> Path:
         .tikz-code pre {
             margin: 0;
         }
+        .error {
+            background: #fff3cd;
+            border: 1px solid #ffeeba;
+            color: #856404;
+            padding: 10px 15px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .compile-error pre {
+            white-space: pre-wrap;
+            margin: 5px 0 0;
+        }
     </style>
 </head>
 <body>
@@ -172,7 +184,9 @@ def write_html_report(result: RunResult) -> Path:
 
     for iteration in result.iterations:
         # Determine similarity class for styling
-        sim_class = "high" if iteration.similarity and iteration.similarity >= 0.9 else ""
+        sim_class = (
+            "high" if iteration.similarity and iteration.similarity >= 0.9 else ""
+        )
 
         rendered_uri = image_to_data_uri(iteration.rendered_path)
 
@@ -183,7 +197,34 @@ def write_html_report(result: RunResult) -> Path:
             .replace(">", "&gt;")
         )
 
-        iter_sim_str = f"{iteration.similarity:.4f}" if iteration.similarity is not None else "N/A"
+        iter_sim_str = (
+            f"{iteration.similarity:.4f}" if iteration.similarity is not None else "N/A"
+        )
+        compile_error_html = ""
+        if iteration.compile_error:
+            error_text = (
+                iteration.compile_error.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            compile_error_html = f"""
+        <div class="error compile-error">
+            <strong>Compilation failed:</strong>
+            <pre>{error_text}</pre>
+        </div>
+"""
+
+        if rendered_uri:
+            rendered_block = (
+                f'<img src="{rendered_uri}" alt="Rendered iteration {iteration.step}">'
+            )
+        else:
+            rendered_block = """
+        <div class="error">
+            Rendered image unavailable for this iteration (compilation failed).
+        </div>
+"""
+
         html_parts.append(f"""
     <div class="iteration">
         <h3>
@@ -192,7 +233,8 @@ def write_html_report(result: RunResult) -> Path:
                 Similarity: {iter_sim_str}
             </span>
         </h3>
-        <img src="{rendered_uri}" alt="Rendered iteration {iteration.step}">
+        {rendered_block}
+        {compile_error_html}
         <h4>TikZ Code:</h4>
         <div class="tikz-code">
             <pre>{tikz_escaped}</pre>

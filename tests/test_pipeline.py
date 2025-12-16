@@ -11,6 +11,7 @@ import pytest
 from PIL import Image
 
 from optikz.core.pipeline import convert_with_iterations
+from optikz.core.render import TikzCompilationError
 
 
 def test_pipeline_stops_at_max_iters(tmp_path: Path, monkeypatch):
@@ -79,6 +80,7 @@ def test_pipeline_stops_at_max_iters(tmp_path: Path, monkeypatch):
 
     # Verify all rendered images exist
     for iteration in result.iterations:
+        assert iteration.rendered_path is not None
         assert iteration.rendered_path.exists()
         assert iteration.similarity == 0.3
 
@@ -271,6 +273,68 @@ def test_pipeline_creates_all_expected_files(tmp_path: Path, monkeypatch):
     assert r"\documentclass[tikz,border=2mm]{standalone}" in standalone_content
     assert r"\begin{tikzpicture}" in standalone_content
     assert r"\end{tikzpicture}" in standalone_content
+
+
+def test_pipeline_retries_when_compilation_fails(tmp_path: Path, monkeypatch):
+    """
+    The pipeline should retry when a TikZ compilation fails without counting
+    the failed attempt toward max_iters.
+    """
+
+    input_img = tmp_path / "input.png"
+    img = Image.new("RGB", (50, 50), color="purple")
+    img.save(input_img)
+
+    monkeypatch.setattr(
+        "optikz.core.pipeline.initial_tikz_from_llm",
+        lambda img: "\\draw (0,0) -- (1,1);",
+    )
+
+    state = {"render_calls": 0, "refine_calls": 0, "last_error": None}
+
+    def mock_render(tikz: str, out_dir: Path) -> Path:
+        if state["render_calls"] == 0:
+            state["render_calls"] += 1
+            raise TikzCompilationError("failed", log_excerpt="! Undefined control")
+        state["render_calls"] += 1
+        rendered = out_dir / "rendered.png"
+        img = Image.new("RGB", (50, 50), color="gray")
+        img.save(rendered)
+        return rendered
+
+    def mock_refine(
+        original_image_path: Path,
+        rendered_image_path: Path | None,
+        current_tikz: str,
+        latex_error: str | None = None,
+    ) -> str:
+        state["refine_calls"] += 1
+        state["last_error"] = latex_error
+        return current_tikz + "\n% fixed compile"
+
+    monkeypatch.setattr("optikz.core.pipeline.render_tikz", mock_render)
+    monkeypatch.setattr("optikz.core.pipeline.calc_similarity", lambda t, r: 0.95)
+    monkeypatch.setattr("optikz.core.pipeline.refine_tikz_via_llm", mock_refine)
+
+    result = convert_with_iterations(
+        image_path=input_img,
+        max_iters=1,
+        similarity_threshold=0.9,
+        work_root=tmp_path / "runs",
+    )
+
+    # Expect two iteration records: one failed compile, one success
+    assert len(result.iterations) == 2
+    assert result.iterations[0].rendered_path is None
+    assert result.iterations[0].similarity is None
+    assert "! Undefined control" in (result.iterations[0].compile_error or "")
+    assert result.iterations[1].rendered_path is not None
+    assert result.iterations[1].similarity == 0.95
+
+    # Verify max_iters counted only the successful render
+    assert state["render_calls"] == 2
+    assert state["refine_calls"] == 1
+    assert state["last_error"] == "! Undefined control"
 
 
 def test_pipeline_raises_error_for_missing_image(tmp_path: Path):

@@ -9,12 +9,135 @@ Handles:
 
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 from skimage.metrics import structural_similarity as ssim
+
+
+class TikzCompilationError(RuntimeError):
+    """
+    Raised when pdflatex cannot compile the generated TikZ document.
+
+    Attributes:
+        log_excerpt: Relevant snippet from the LaTeX log (if available)
+    """
+
+    def __init__(self, message: str, log_excerpt: str | None = None):
+        super().__init__(message)
+        self.log_excerpt = log_excerpt
+
+
+def _build_latex_document(tikz: str) -> str:
+    """Wrap TikZ content in a minimal standalone document."""
+    return (
+        r"""
+\documentclass[tikz,border=2mm]{standalone}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,calc,patterns,decorations.pathreplacing}
+
+\begin{document}
+\begin{tikzpicture}
+"""
+        + tikz
+        + r"""
+\end{tikzpicture}
+\end{document}
+"""
+    )
+
+
+def _extract_log_excerpt(log_path: Path, max_lines: int = 20) -> str | None:
+    """
+    Extract a concise error summary from a LaTeX .log file.
+
+    Looks for lines starting with "!" (LaTeX errors) and includes a few lines of
+    context. Falls back to the last few lines if no explicit error markers are
+    found.
+    """
+    if not log_path.exists():
+        return None
+
+    try:
+        lines = log_path.read_text(errors="ignore").splitlines()
+    except Exception:
+        return None
+
+    excerpt: list[str] = []
+    for idx, line in enumerate(lines):
+        if line.startswith("!"):
+            excerpt.extend(lines[idx : min(len(lines), idx + 3)])
+
+    if not excerpt:
+        excerpt = lines[-max_lines:]
+
+    trimmed = [line.rstrip() for line in excerpt[-max_lines:]]
+    text = "\n".join(line for line in trimmed if line.strip())
+    return text or None
+
+
+def compile_tikz(tikz: str, out_dir: Path) -> tuple[bool, str | None]:
+    """
+    Compile TikZ code to PDF using pdflatex and capture LaTeX errors.
+
+    Args:
+        tikz: TikZ code that will be wrapped in a standalone document.
+        out_dir: Directory where temporary LaTeX artifacts are written.
+
+    Returns:
+        Tuple of (success flag, latex_log_excerpt).
+        On success, returns (True, None).
+        On failure, returns (False, error_snippet_from_log).
+
+    Raises:
+        FileNotFoundError: If pdflatex is not installed.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not shutil.which("pdflatex"):
+        raise FileNotFoundError(
+            "pdflatex not found. Please install a LaTeX distribution "
+            "(e.g., TeX Live, MacTeX)"
+        )
+
+    tex_file = out_dir / "diagram.tex"
+    tex_file.write_text(_build_latex_document(tikz))
+
+    try:
+        completed = subprocess.run(
+            [
+                "pdflatex",
+                "-interaction=nonstopmode",
+                "-halt-on-error",
+                "diagram.tex",
+            ],
+            cwd=out_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        returncode = completed.returncode
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+    except subprocess.CalledProcessError as exc:
+        returncode = exc.returncode
+        stdout = getattr(exc, "stdout", "") or ""
+        stderr = getattr(exc, "stderr", "") or ""
+
+    pdf_file = out_dir / "diagram.pdf"
+    log_path = out_dir / "diagram.log"
+    log_excerpt = _extract_log_excerpt(log_path)
+
+    if returncode != 0 or not pdf_file.exists():
+        if not log_excerpt:
+            stderr = stderr.strip()
+            stdout = stdout.strip()
+            combined = "\n".join(line for line in [stderr, stdout] if line)
+            log_excerpt = combined or "pdflatex failed without log output."
+        return False, log_excerpt
+
+    return True, None
 
 
 def render_tikz(tikz: str, out_dir: Path) -> Path:
@@ -23,7 +146,7 @@ def render_tikz(tikz: str, out_dir: Path) -> Path:
 
     Process:
     1. Create a minimal standalone LaTeX document with the TikZ code
-    2. Compile to PDF using pdflatex
+    2. Compile to PDF using pdflatex (via compile_tikz)
     3. Convert PDF to PNG using Ghostscript
 
     Args:
@@ -34,97 +157,58 @@ def render_tikz(tikz: str, out_dir: Path) -> Path:
         Path to the generated PNG file
 
     Raises:
-        RuntimeError: If pdflatex or gs (Ghostscript) fail
+        TikzCompilationError: If pdflatex fails to compile the document
+        RuntimeError: If Ghostscript conversion fails
         FileNotFoundError: If required tools are not installed
     """
-    # Ensure output directory exists
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check for required tools
-    if not shutil.which("pdflatex"):
-        raise FileNotFoundError(
-            "pdflatex not found. Please install a LaTeX distribution (e.g., TeX Live, MacTeX)"
+    success, log_excerpt = compile_tikz(tikz, out_dir)
+    if not success:
+        raise TikzCompilationError(
+            "pdflatex compilation failed. See latex_error.txt for details.",
+            log_excerpt=log_excerpt,
         )
+
+    pdf_file = out_dir / "diagram.pdf"
+    if not pdf_file.exists():
+        raise TikzCompilationError(
+            "pdflatex reported success but did not produce diagram.pdf."
+        )
+
+    png_file = out_dir / "rendered.png"
+
+    # Ensure Ghostscript is available right before conversion
     if not shutil.which("gs"):
         raise FileNotFoundError(
             "gs (Ghostscript) not found. Install via: brew install ghostscript"
         )
 
-    # Create a temporary directory for LaTeX compilation
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmppath = Path(tmpdir)
+    try:
+        subprocess.run(
+            [
+                "gs",
+                "-dSAFER",
+                "-dBATCH",
+                "-dNOPAUSE",
+                "-sDEVICE=png16m",
+                "-r300",  # 300 DPI
+                "-dTextAlphaBits=4",
+                "-dGraphicsAlphaBits=4",
+                f"-sOutputFile={png_file}",
+                str(pdf_file),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"Ghostscript conversion failed:\n{e.stderr}\n{e.stdout}"
+        ) from e
 
-        # Build the standalone LaTeX document
-        # Standalone class auto-crops to content
-        # TODO: Make preamble configurable to support additional TikZ libraries
-        latex_doc = r"""
-\documentclass[tikz,border=2mm]{standalone}
-\usepackage{tikz}
-\usetikzlibrary{shapes,arrows,positioning,calc,patterns,decorations.pathreplacing}
-
-\begin{document}
-\begin{tikzpicture}
-""" + tikz + r"""
-\end{tikzpicture}
-\end{document}
-"""
-
-        # Write LaTeX source
-        tex_file = tmppath / "diagram.tex"
-        tex_file.write_text(latex_doc)
-
-        # Compile with pdflatex
-        # Run twice to resolve references if any
-        try:
-            subprocess.run(
-                [
-                    "pdflatex",
-                    "-interaction=nonstopmode",
-                    "-halt-on-error",
-                    "diagram.tex",
-                ],
-                cwd=tmppath,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"pdflatex compilation failed:\n{e.stderr}\n{e.stdout}"
-            ) from e
-
-        pdf_file = tmppath / "diagram.pdf"
-        if not pdf_file.exists():
-            raise RuntimeError("pdflatex did not produce diagram.pdf")
-
-        # Convert PDF to PNG using Ghostscript
-        # Use high resolution for better comparison
-        png_file = out_dir / "rendered.png"
-        try:
-            subprocess.run(
-                [
-                    "gs",
-                    "-dSAFER",
-                    "-dBATCH",
-                    "-dNOPAUSE",
-                    "-sDEVICE=png16m",
-                    "-r300",  # 300 DPI
-                    "-dTextAlphaBits=4",
-                    "-dGraphicsAlphaBits=4",
-                    f"-sOutputFile={png_file}",
-                    str(pdf_file),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"Ghostscript conversion failed:\n{e.stderr}\n{e.stdout}"
-            ) from e
-
-        if not png_file.exists():
-            raise RuntimeError("Ghostscript did not produce PNG output")
+    if not png_file.exists():
+        raise RuntimeError("Ghostscript did not produce PNG output")
 
     return png_file
 
@@ -133,7 +217,8 @@ def calc_similarity(target_img: Path, rendered_img: Path) -> float:
     """
     Calculate similarity between two images using SSIM (Structural Similarity Index).
 
-    Both images are converted to grayscale and resized to a fixed size before comparison.
+    Both images are converted to grayscale and resized to a fixed size before
+    comparison.
     SSIM returns a value in [-1, 1] but typically in [0, 1] for real images, where
     1.0 means identical.
 
